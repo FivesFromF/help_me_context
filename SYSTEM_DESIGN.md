@@ -1,7 +1,7 @@
 # HelpMe System Design (Emergency Response System)
 
 > **Status:** This document describes the **as-built** architecture in `help_me_backend`.
-> The backend was migrated from an earlier **Go + ECS Fargate** design to **TypeScript AWS Lambdas**; the Python AI service remains on ECS. Where the intended end-state and the current code differ, it is called out explicitly under **Migration status** (§7).
+> The backend was migrated from an earlier **Go + ECS Fargate** design to **TypeScript AWS Lambdas**, with the Python AI service as a **container-image Lambda**. Nothing runs on ECS anymore. Remaining leftovers are called out under **Migration status** (§7).
 
 ---
 
@@ -9,7 +9,7 @@
 
 **Serverless, event-driven.** A synchronous request path (API Gateway → Lambda) handles reads/writes, and an asynchronous **dual-bus** EventBridge backbone separates operational/compliance events from emergency-response events.
 
-* **Compute:** AWS Lambda (API + async workers, TypeScript); Amazon ECS Fargate (Python AI service only).
+* **Compute:** AWS Lambda everywhere — TypeScript (zip) Lambdas for the API + async workers, and a Python **container-image** Lambda for the AI service.
 * **API protocol:** REST over HTTP, fronted by **API Gateway v2 (HTTP API)**. Lambda handlers use `itty-router`.
 * **Event backbone:** Amazon EventBridge — two separate buses (system + emergency).
 * **Identity:** AWS Cognito (User Pool + Groups; federated Google sign-in).
@@ -66,9 +66,11 @@ The value written to a tag is an **HMAC-SHA256 of the citizen id under `SYSTEM_S
 
 ## 5. AI processing (`help_me_backend/src/functions/ai-service`)
 
-Python **FastAPI** service (mirrors `help_me_ai_face_poc`), deployed on **ECS Fargate**, gated by an `X-HelpMe-Secret` header.
+A Python **container-image Lambda** (ported from `help_me_ai_face_poc`): base `public.ecr.aws/lambda/python:3.12`, 3008 MB RAM, 30s timeout, CPU-only PyTorch. Entrypoint `app.lambda_handler` receives `{ "image": "<base64>" }` (or `{ "is_warmup": true }`) and returns `{ success, embedding }` (512 floats). It is invoked directly by the read/write-service Lambdas via the AWS SDK (`AI_LAMBDA_NAME`).
 
-Pipeline: **MediaPipe** face validation → **Silent-Face anti-spoofing** (liveness) → **EdgeFace** 512-d embedding. Endpoints: `POST /extract` (returns the embedding), `GET /health`. Vendored model folders (`anti_spoofing/`, `edgeface/`, `face_landmark/`) are treated as read-only.
+Pipeline (`regconition_original.py` → `FaceProcessor.process_image`): **MediaPipe FaceLandmarker** face detection + quality gate (yaw/pitch ≤ 15°, face area 10–50% of frame) → crop with 15% padding → **Silent-Face anti-spoofing** (MiniFASNetV2 liveness) → **EdgeFace** (`edgeface_s_gamma_05`) → 512-d L2-normalized embedding. Vendored model folders (`anti_spoofing/`, `edgeface/`, `face_landmark/`) are read-only.
+
+> `main.py` (a FastAPI `/extract` variant) is **not deployed** — the Dockerfile runs `app.lambda_handler`. It is dead/alternate code.
 
 ---
 
@@ -111,18 +113,27 @@ graph TD
 
 **Design intent:** operational workers (e.g. Notification) never receive Core-Bus events, limiting data-access scope; the Audit Worker consolidates both buses into one DynamoDB table for a single admin-queryable view.
 
+**Implementation.** `src/services/events.service.ts` publishes events (`source: helpme.backend`); publishing is best-effort and never breaks the caller. The read/write-service Lambdas emit:
+- **System bus:** `citizen.profile.updated`, `medical_record.updated`, `citizen.face.registered`, `nfc.registered` (compliance/CRUD audit).
+- **Emergency bus:** `victim.identified` on a successful staff/admin `/read/scan` (NFC or FACE), carrying `responderId`, `targetId` (victim), and `method`.
+
+Workers (all implemented):
+- **audit-worker** → writes every event (both buses) to the `audit-logs` table (`actor_id` hash / `timestamp` range = `<iso>#<eventId>`).
+- **grant-permission-worker** → on `victim.identified`, writes an `access-sessions` row `session_id = <responderId>#<victimId>` with a 1-hour DynamoDB TTL (`expires_at`).
+- **notification-worker** → on `victim.identified`, loads the victim's `emergency_contacts` (JSONB) and emails any contact with an `email` field via SMTP (nodemailer).
+
 New citizens are provisioned by a Cognito **post-confirmation** Lambda trigger, which assigns the `Citizens` group and inserts the `citizens` row.
 
 ---
 
-## 7. Migration status (current gaps)
+## 7. Migration status
 
-The as-built system is **mid-migration**; the following are not yet reconciled:
+**Done:** control plane is TypeScript Lambdas; the AI service is a container-image Lambda (no ECS/FastAPI seam); the relational layer is a single Supabase Postgres; the async workers + dual-bus `PutEvents` wiring are implemented (§6). Deploy tooling — `.github/workflows/deploy.yml` and `scripts/deploy.ps1` — builds the TS bundles (`node build.js` → `dist/`) and the AI container, then runs `terraform apply`. All dead pre-migration infra has been removed: the `ecs`, `bastion`, `lambda_proxy`, and `vpc` modules, the `read/write_container_image` inputs, the RDS module + `db_password`/`db_cluster_endpoint` plumbing, the Cloud Map service-discovery namespace, the ECS-scaling `cloud-start/stop.ps1` scripts, and `src_go_archive/`. Terraform now stands up **only** Lambda + API Gateway + Cognito + EventBridge + DynamoDB + S3 + Supabase (no VPC — no Lambda is VPC-attached).
 
-1. **Deploy tooling is stale.** `deploy.yml`, `scripts/deploy.ps1`, and `LOCAL_TESTING.md` still build the retired **Go binaries + ECS Docker images** (`src/cmd/*`, `src_go_archive/`). No end-to-end pipeline currently packages the live TypeScript Lambdas (`node build.js` → `dist/`).
-2. **AI invocation seam.** `write/read-service` call the AI service via **Lambda invoke** (`AI_LAMBDA_NAME`), but the AI service is deployed as a **FastAPI/ECS** endpoint. Only one path is live.
-3. **ECS being retired** — the remaining ECS container-image inputs in `infra/main.tf` are hard-coded `"DEPRECATED"`; the target end-state is Lambda-only except for the Python AI workload. (The relational-DB side is already clean: the RDS module and `db_password`/`db_cluster_endpoint` plumbing have been removed — Supabase is the sole relational store.)
-4. **Async workers are stubs** — `audit-worker`, `notification-worker`, `grant-permission-worker` are wired to EventBridge but largely unimplemented; DynamoDB audit/session tables exist in Terraform but are not yet written to from the TS code.
+**Known gaps / follow-ups:**
+
+1. **Emergency-contact emails** — `notification-worker` emails contacts that carry an `email` field, but `FUNCTIONAL_REQUIREMENTS.md` models emergency contacts with phone numbers, not email. Either add `email` to the contact shape or switch the channel; today contacts without an email are silently skipped (logged).
+2. **Session enforcement** — `grant-permission-worker` writes `access-sessions`, but the read-service does not yet *check* a session before returning a victim's record on scan (the scan itself is the grant trigger). Add session validation if staff access should be gated on an existing grant.
 
 ---
 
