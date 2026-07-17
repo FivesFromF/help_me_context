@@ -25,7 +25,7 @@ Flutter app ──JWT──▶ API Gateway v2 ──▶ Lambda Authorizer ──
 ```
 
 * **Lambda Authorizer** (`src/functions/authorizer`) verifies the Cognito JWT (`aws-jwt-verify`), derives `role` from `cognito:groups` (`citizen` | `staff` | `admin`), and injects `{ userId, role }` into the request context. A `publicPaths` whitelist (`/signin`, `/user/verify`, `/user/search`, `/user/register`, `/health`) bypasses auth.
-* **read-service** (`src/functions/read-service`): GET profile / medical record / NFC tags; staff & admin identification lookups.
+* **read-service** (`src/functions/read-service`): GET profile / medical record / NFC tags; staff & admin identification lookups (`POST /read/scan`); session-gated victim re-access (`GET /read/victim/:victimId`).
 * **write-service** (`src/functions/write-service`): PUT profile & medical record; POST face registration; POST NFC registration.
 * Handlers read auth via `getAuthContext(event)` and enforce access with `requireRole([...])` (see `src/utils/router.ts`).
 
@@ -119,7 +119,7 @@ graph TD
 
 Workers (all implemented):
 - **audit-worker** → writes every event (both buses) to the `audit-logs` table (`actor_id` hash / `timestamp` range = `<iso>#<eventId>`).
-- **grant-permission-worker** → on `victim.identified`, writes an `access-sessions` row `session_id = <responderId>#<victimId>` with a 1-hour DynamoDB TTL (`expires_at`).
+- **grant-permission-worker** → on `victim.identified`, writes an `access-sessions` row `session_id = <responderId>#<victimId>` with a 1-hour DynamoDB TTL (`expires_at`). This grant is **enforced** by the read-service's `GET /read/victim/:victimId` endpoint (`services/session.service.ts` → `hasActiveSession`, which re-checks `expires_at` rather than trusting TTL deletion, and fails closed on error).
 - **notification-worker** → on `victim.identified`, loads the victim's `emergency_contacts` (JSONB) and emails any contact with an `email` field via SMTP (nodemailer).
 
 New citizens are provisioned by a Cognito **post-confirmation** Lambda trigger, which assigns the `Citizens` group and inserts the `citizens` row.
@@ -133,7 +133,8 @@ New citizens are provisioned by a Cognito **post-confirmation** Lambda trigger, 
 **Known gaps / follow-ups:**
 
 1. **Emergency-contact emails** — `notification-worker` emails contacts that carry an `email` field, but `FUNCTIONAL_REQUIREMENTS.md` models emergency contacts with phone numbers, not email. Either add `email` to the contact shape or switch the channel; today contacts without an email are silently skipped (logged).
-2. **Session enforcement** — `grant-permission-worker` writes `access-sessions`, but the read-service does not yet *check* a session before returning a victim's record on scan (the scan itself is the grant trigger). Add session validation if staff access should be gated on an existing grant.
+
+> **Resolved (2026-07):** Session enforcement. `POST /read/scan` remains the grant trigger (identify → emit `victim.identified` → `grant-permission-worker` writes the 1-hour session). Re-access is now gated: `GET /read/victim/:victimId` calls `hasActiveSession` (fails closed, re-checks `expires_at`) and 403s without a live grant, and audits each hit via `victim.record.accessed` on the system bus.
 
 ---
 
