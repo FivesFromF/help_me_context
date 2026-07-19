@@ -120,7 +120,7 @@ graph TD
 Workers (all implemented):
 - **audit-worker** → writes every event (both buses) to the `audit-logs` table (`actor_id` hash / `timestamp` range = `<iso>#<eventId>`).
 - **grant-permission-worker** → on `victim.identified`, writes an `access-sessions` row `session_id = <responderId>#<victimId>` with a 1-hour DynamoDB TTL (`expires_at`). This grant is **enforced** by the read-service's `GET /read/victim/:victimId` endpoint (`services/session.service.ts` → `hasActiveSession`, which re-checks `expires_at` rather than trusting TTL deletion, and fails closed on error).
-- **notification-worker** → on `victim.identified`, loads the victim's `emergency_contacts` (JSONB) and emails any contact with an `email` field via SMTP (nodemailer).
+- **notification-worker** → on `victim.identified`, loads the victim's `emergency_contacts` (JSONB, shape `{ name, relationship, phone, backupPhone, email }`) and alerts **every reachable channel per contact**: email via SMTP (nodemailer) and SMS via **AWS SNS** (`phone`/`backupPhone`, normalized to E.164, VN `+84` default). Phone-only contacts are no longer skipped.
 
 New citizens are provisioned by a Cognito **post-confirmation** Lambda trigger, which assigns the `Citizens` group and inserts the `citizens` row.
 
@@ -130,11 +130,13 @@ New citizens are provisioned by a Cognito **post-confirmation** Lambda trigger, 
 
 **Done:** control plane is TypeScript Lambdas; the AI service is a container-image Lambda (no ECS/FastAPI seam); the relational layer is a single Supabase Postgres; the async workers + dual-bus `PutEvents` wiring are implemented (§6). Deploy tooling — `scripts/deploy.ps1` (no CI) — builds the TS bundles (`node build.js` → `dist/`) and the AI container, then runs `terraform apply`. All dead pre-migration infra has been removed: the `ecs`, `bastion`, `lambda_proxy`, and `vpc` modules, the `read/write_container_image` inputs, the RDS module + `db_password`/`db_cluster_endpoint` plumbing, the Cloud Map service-discovery namespace, the ECS-scaling `cloud-start/stop.ps1` scripts, and `src_go_archive/`. Terraform now stands up **only** Lambda + API Gateway + Cognito + EventBridge + DynamoDB + S3 + Supabase (no VPC — no Lambda is VPC-attached).
 
-**Known gaps / follow-ups:**
+**Recently resolved:**
 
-1. **Emergency-contact emails** — `notification-worker` emails contacts that carry an `email` field, but `FUNCTIONAL_REQUIREMENTS.md` models emergency contacts with phone numbers, not email. Either add `email` to the contact shape or switch the channel; today contacts without an email are silently skipped (logged).
-
+> **Resolved (2026-07):** Emergency-contact channel. `notification-worker` no longer emails-only. It now alerts **every reachable channel** on each contact — email via SMTP **and** SMS via AWS SNS for `phone`/`backupPhone` (normalized to E.164, VN `+84` default) — so phone-only contacts are reached. The worker role gained `sns:Publish`.
+>
 > **Resolved (2026-07):** Session enforcement. `POST /read/scan` remains the grant trigger (identify → emit `victim.identified` → `grant-permission-worker` writes the 1-hour session). Re-access is now gated: `GET /read/victim/:victimId` calls `hasActiveSession` (fails closed, re-checks `expires_at`) and 403s without a live grant, and audits each hit via `victim.record.accessed` on the system bus.
+
+**Operational prerequisite (SMS):** AWS SNS SMS starts in the **sandbox** (only verified numbers, capped spend). Before SMS reaches arbitrary next-of-kin in production, move the account out of the SNS SMS sandbox and set an SMS spending limit in the SNS console. Email is unaffected.
 
 ---
 
